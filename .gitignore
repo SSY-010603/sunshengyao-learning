@@ -1,0 +1,25 @@
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI Agent 临时文件
+.cursor/
+.claude/
+.codeflicker/
+.kwaipilot/
+
+# Node / Python（学员可能跑示例代码）
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+
+# 日志和临时文件
+*.log
+.tmp/
