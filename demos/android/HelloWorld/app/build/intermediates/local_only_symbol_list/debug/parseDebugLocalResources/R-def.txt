@@ -1,0 +1,7 @@
+R_DEF: Internal format may change without notice
+local
+id button
+id subtitle
+id textView
+layout activity_main
+string app_name
