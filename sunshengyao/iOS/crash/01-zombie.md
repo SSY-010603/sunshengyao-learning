@@ -492,6 +492,242 @@ NSSet *retainCycles = [detector findRetainCycles];
 
 ---
 
+## NSObject vs CF：两条释放路径
+
+你前面学的所有内容（hook dealloc、NSZombieEnabled、weak/strong）都是基于 **NSObject** 的。但 iOS 里还有一类对象的释放不走 NSObject 的 `dealloc`——**通过 CF API（CFRelease）管理的 CoreFoundation 对象**。
+
+### 什么是 CF 对象
+
+CF = CoreFoundation，Apple 的**纯 C 语言框架**。你日常用的 `NSString`、`NSArray` 底层就是 CF 对象（Toll-Free Bridging）：
+
+```objc
+// 你写的
+NSString *s = @"Hello";
+// 运行时实际类是 __NSCFString（NSString 的 CF 桥接子类）
+
+// CF 和 ObjC 可以零成本互转（Toll-Free Bridging）
+CFStringRef cfStr = CFSTR("Hello");
+NSString *objcStr = (__bridge NSString *)cfStr;   // 直接强转，不需要转换函数
+```
+
+| CF 类型（C） | ObjC 类型 | 说明 |
+|---|---|---|
+| `CFStringRef` | `NSString *` | 字符串（**最常见的难定位 zombie 类型**） |
+| `CFArrayRef` | `NSArray *` | 数组 |
+| `CFDictionaryRef` | `NSDictionary *` | 字典 |
+| `CFNumberRef` | `NSNumber *` | 数字 |
+
+### 两条释放路径——关键区别
+
+**⚠️ 这里需要区分两种情况**：
+
+**情况 A：ARC 管理的桥接 CF 对象（如 `__NSCFString`）** — **走 dealloc**
+
+```
+ARC 管理 __NSCFString 的释放：
+  objc_release(obj) → 引用计数=0 → [obj dealloc] 被调用
+  → dealloc 内部调用 CF 释放路径（CFAllocatorDeallocate）
+  ✅ 可以 hook dealloc 记录 free 堆栈
+  ✅ NSZombieEnabled 能捕获（因为走了 dealloc，isa 会被替换）
+```
+
+这种情况和纯 NSObject 一样！你前面学的 hook dealloc 方案对它有效。
+
+**情况 B：通过 CFRelease 手动释放的 CF 对象** — **不走 dealloc**
+
+```
+CF API 管理的 CF 对象释放：
+  CFRelease(obj) → CFAllocatorDeallocate(allocator, ptr)
+                  ├── allocator 是 malloc_zone_t → malloc_zone_free(zone, ptr)
+                  └── allocator 是 CFAllocator    → context.deallocate(ptr, info)
+  ❌ 不走 dealloc，hook dealloc 捕获不到
+  ❌ NSZombieEnabled 检测不到（isa 不会被替换）
+```
+
+**问题来了**：既然 ARC 管理的 `__NSCFString` 走 dealloc，那为什么 CF zombie 还是难排查？
+
+答案是 **autorelease pool 场景**。当 `__NSCFString` 被 autorelease 后，它的释放发生在 pool drain 时：
+
+```
+_objc_release → AutoreleasePoolPage::releaseUntil → _objc_autoreleasePoolPop
+```
+
+此时即使你 hook dealloc 拿到了 free 堆栈，**崩溃堆栈本身全是系统符号**（见下文），看不到是哪个业务代码持有旧引用——这是 CF zombie 难定位的真正原因。
+
+**总结**：hook dealloc 可以拿到 free 堆栈，但对 autorelease pool 触发的 CF zombie 来说，free 堆栈本身也是系统符号，定位能力有限。要更好地区分 CF 对象的释放来源（是 ARC 自动释放还是 CFRelease 手动释放），需要深入 CFAllocatorDeallocate 路径。
+
+### CF Zombie 的典型崩溃堆栈
+
+```
+Thread 0 Crashed:
+0  libobjc.A.dylib      _objc_release()
+1  libobjc.A.dylib      AutoreleasePoolPage::releaseUntil()
+2  libobjc.A.dylib      _objc_autoreleasePoolPop()
+3  libdispatch.dylib    __dispatch_last_resort_autorelease_pool_pop()
+4  libdispatch.dylib    __dispatch_lane_invoke()
+```
+
+**全是系统符号，看不到任何业务特征**——不知道是哪个 VC/Manager 的对象被提前释放了。这是 CF zombie 最恶心的地方：堆栈里找不到你自己的代码。
+
+### 为什么 CF zombie 更难排查
+
+| | 普通 NSObject zombie | ARC 管理的 CF 桥接对象（如 __NSCFString） | 纯 CF 对象（CFRelease 管理） |
+|---|---|---|---|
+| 释放路径 | `dealloc` | `dealloc` → 内部走 CF 路径 | `CFRelease` → `CFAllocatorDeallocate` |
+| 能否 hook dealloc | ✅ | ✅ 走 dealloc | ❌ 不走 dealloc |
+| NSZombieEnabled | ✅ 能捕获 | ✅ 能捕获 | ❌ 检测不到（不走 dealloc，isa 不被替换） |
+| autorelease pool 场景的崩溃堆栈 | 通常有业务方法 | **全是系统符号** | **全是系统符号** |
+| free 堆栈获取 | hook dealloc 即可 | hook dealloc 可拿，但 free 堆栈也是系统符号 | **必须 hook CFAllocatorDeallocate** |
+| 最常见的难定位类型 | 自定义 VC/View | **`__NSCFString`**（autorelease pool 场景） | `CGColorRef` 等 C API 创建的对象 |
+
+> **核心难点**：autorelease pool 触发的 CF zombie 崩溃，无论你能不能拿到 free 堆栈，崩溃堆栈本身都是系统符号（`_objc_release → AutoreleasePoolPage::releaseUntil → _objc_autoreleasePoolPop`），看不到业务特征。这就是为什么需要深入 `CFAllocatorDeallocate` 路径——在那里能按 CFTypeID 筛选，更精确地定位"哪种 CF 对象被释放了"。
+
+---
+
+## CF Zombie 的生产环境监控方案
+
+NSObject 的生产监控靠 hook dealloc（前面方案 1 已讲）。CF 对象必须走另一条路。以下方案来源于快手内部技术探索（作者 yuec）。
+
+### 核心难点：hook CFAllocatorDeallocate
+
+`CFAllocatorDeallocate` 有两条分支：
+
+```c
+void CFAllocatorDeallocate(CFAllocatorRef allocator, void *ptr) {
+    if (allocator->_base._cfisa != __CFISAForTypeID(__kCFAllocatorTypeID)) {
+        // 分支 A：allocator 是 malloc_zone_t → 直接 zone free
+        return malloc_zone_free((malloc_zone_t *)allocator, ptr);
+    }
+    // 分支 B：allocator 是 CFAllocator → 调 context 的 deallocate
+    deallocateFunc = __CFAllocatorGetDeallocateFunction(&allocator->_context);
+    if (ptr && deallocateFunc) {
+        INVOKE_CALLBACK2(deallocateFunc, ptr, allocator->_context.info);
+    }
+}
+```
+
+要记录 free 堆栈，就得想办法在这两个分支上插钩子。
+
+### 方案 1：将 default allocator 替换为 malloc_zone_t
+
+```objc
+// 核心思路：创建自定义 zone，hook 它的 3 个 free 方法
+// 然后绕开 CFAllocatorSetDefault（它禁止设置 malloc_zone_t 类型）
+// 直接用 _CFSetTSD 将 zone 写入线程局部存储
+
+void (*origin_cf_zone_free)(struct _malloc_zone_t *zone, void *ptr);
+void (*origin_cf_zone_free_definite_size)(struct _malloc_zone_t *zone, void *ptr, size_t size);
+void (*origin_cf_zone_try_free_default)(struct _malloc_zone_t *zone, void *ptr);
+
+void new_cf_zone_free(struct _malloc_zone_t *zone, void *ptr) {
+    // ⬇️ 在这里记录 ptr 的调用栈 → free 堆栈
+    origin_cf_zone_free(zone, ptr);
+}
+
+void swizzle_cf_deallocate() {
+    malloc_zone_t *cf_zone = malloc_create_zone(0, 0);
+    origin_cf_zone_free = cf_zone->free;
+    // ... 保存其他原始方法
+    mprotect(cf_zone, sizeof(malloc_zone_t), PROT_READ | PROT_WRITE);
+    cf_zone->free = new_cf_zone_free;
+    // ... 替换其他方法
+    _CFSetTSD(1, cf_zone, nil);  // ⚠️ 私有 API，直接写入 TSD
+}
+```
+
+**优点**：替换后新创建的 CF 对象走 zone free，能记录堆栈
+**风险**：`_CFSetTSD` 是私有 API；替换前已分配的 CF 对象实测不需要特殊处理（仍走原 CFAllocator deallocate）
+
+### 方案 2：自定义 CFAllocator 替换 default
+
+```objc
+// 核心思路：获取 default allocator 的 context，替换 deallocate 回调
+
+void (*cf_origin_deallocate)(void *ptr, void *info);
+void cf_new_deallocate(void *ptr, void *info) {
+    // ⬇️ 在这里记录 ptr 的调用栈
+    cf_origin_deallocate(ptr, info);
+}
+
+CFAllocatorContext context = { 0 };
+CFAllocatorGetContext(CFAllocatorGetDefault(), &context);
+cf_origin_deallocate = context.deallocate;
+context.deallocate = cf_new_deallocate;
+CFAllocatorSetDefault(CFAllocatorCreate(kCFAllocatorDefault, &context));
+```
+
+**优点**：不改变分配器类型，对内存管理影响更小
+**致命问题**：`UIGraphicsEndImageContext` 时崩溃（`Non-aligned pointer being freed`），**不可用**
+
+### 方案 3（推荐）：直接修改 default allocator 的 deallocate 指针
+
+```objc
+// 核心思路：映射 __CFAllocator 私有结构体，直接替换 _context.deallocate
+// 影响范围最小——只改了一个函数指针
+
+// 映射私有结构体（简化，关键字段）
+struct __CFAllocator {
+    CFRuntimeBase _base;
+    // ... malloc_zone_t 兼容字段 ...
+    CFAllocatorRef _allocator;
+    CFAllocatorContext _context;     // ← 我们要改的就是这个里的 deallocate
+};
+
+void (*cf_origin_deallocate)(void *ptr, void *info);
+void cf_new_deallocate(void *ptr, void *info) {
+    CFTypeID typeID = __CFGenericTypeID_inline(ptr);
+    if (typeID == CFStringGetTypeID()) {
+        // ⬇️ 按类型筛选，只记录 __NSCFString 等可疑类型的 free 堆栈
+    }
+    cf_origin_deallocate(ptr, info);
+}
+
+void swizzle_cf_deallocate() {
+    struct __CFAllocator *cf_allocator = (struct __CFAllocator *)CFAllocatorGetDefault();
+    cf_origin_deallocate = cf_allocator->_context.deallocate;
+    
+    // 安全校验：确保结构体映射正确
+    CFAllocatorContext context = { 0 };
+    CFAllocatorGetContext(CFAllocatorGetDefault(), &context);
+    if (cf_allocator->_context.deallocate != context.deallocate) {
+        return;  // 映射不一致，放弃
+    }
+    
+    // 可能需要 mprotect 保证内存可写
+    cf_allocator->_context.deallocate = cf_new_deallocate;
+}
+```
+
+**优点**：
+- 影响最小（只改一个函数指针）
+- 可以按 `CFTypeID` 筛选，只监控 `__NSCFString` 等高发类型
+- 容易扩展：同样方式也能 hook `_context.allocate` 记录分配堆栈
+- 有校验机制：通过 `CFAllocatorGetContext` 验证映射是否正确
+
+**风险**：映射私有结构体在系统更新后可能失效（但有校验兜底）
+
+### 三方案对比
+
+| | 方案 1 | 方案 2 | 方案 3 ✅ |
+|---|---|---|---|
+| 做法 | 替换 allocator 为 malloc_zone_t | 自定义 CFAllocator | 修改 deallocate 指针 |
+| 侵入范围 | 整个 allocator 类型 | 整个 allocator 对象 | **一个函数指针** |
+| 可行性 | ✅ 已验证 | ❌ UIGraphicsEndImageContext 崩 | ✅ 已验证 |
+| 类型筛选 | zone free 里判断 | deallocate 里判断 | deallocate 里按 CFTypeID 筛选 |
+| 扩展性 | 可 hook allocate | 可 hook allocate | **可 hook allocate**（同方式） |
+| 风险 | `_CFSetTSD` 私有 API | 崩溃原因不明 | 私有结构体映射（有校验兜底） |
+
+### CF 监控的后续挑战
+
+这套方案只解决了"如何获取 CF 对象的 free 堆栈"，线上落地还有几个关键问题：
+
+1. **zombie 检测选型**：修改 isa（NSZombieEnabled 的方式） vs 保存 ptr+堆栈的映射关系
+2. **堆栈存储与查询**：大量 free 堆栈如何高效存储和检索
+3. **对象加权**：autorelease 对象重点监控（生命周期由 pool drain 决定，更难追踪）
+4. **过滤策略**：线上不可能监控所有 CF 对象，需要过滤掉不可能产生 zombie 的对象，保证崩溃时问题对象的 free 堆栈已被记录
+
+---
+
 ## 防范 Zombie 的编码规范
 
 | 规范 | 说明 | ObjC 正确示例 |
@@ -513,8 +749,10 @@ NSSet *retainCycles = [detector findRetainCycles];
 3. **泄漏和 zombie 是因果关系**：循环引用导致泄漏，泄漏被打破后裸引用变 zombie
 4. **5 类典型场景**：Timer 没清理、block 强引用 self、delegate 非 weak、ObjC assign property、KVO 未移除
 5. **排障首选 NSZombieEnabled**，一行日志直接定位类名；需要调用栈用 ASan；需要生命周期全貌用 Instruments
-6. **生产监控靠基建**：hook dealloc + 延迟释放 + 采样上报，或基于 crash 报告的调用栈归因
-7. **防范重于排障**：delegate 一律 weak、block 默认 weak self、Timer 用 block API、混编头文件巡检
+6. **NSObject 和 CF 有两条释放路径**：ARC 管理的桥接 CF 对象（如 `__NSCFString`）仍走 dealloc；纯 CF 对象（通过 CFRelease 释放）走 `CFAllocatorDeallocate`，不走 dealloc
+7. **CF zombie 最难排查的是 autorelease pool 场景**：崩溃堆栈全是系统符号，看不到业务特征；`__NSCFString` 是最高发类型
+8. **CF 生产监控推荐方案 3**：修改 default CFAllocator 的 `_context.deallocate` 指针——侵入最小、可按 CFTypeID 筛选、有校验兜底
+9. **防范重于排障**：delegate 一律 weak、block 默认 weak self、Timer 用 block API、混编头文件巡检
 
 ---
 
@@ -522,7 +760,7 @@ NSSet *retainCycles = [detector findRetainCycles];
 
 - **当前端**：iOS
 - **当前专题**：Crash 疑难排障
-- **本文覆盖**：Zombie Object 的原理、典型场景、排障工具、生产监控方案、防范规范
+- **本文覆盖**：Zombie Object 的原理、典型场景、排障工具、NSObject 与 CF 两条释放路径、生产监控方案、防范规范
 - **整体进度**：阶段 1 ✅ 已完成 | 阶段 2 ⚪ 未开始 | 阶段 3 ⚪ 未开始
 - **当前能力等级**：已掌握 iOS 基础 UI 开发；正在建立 crash 疑难排障能力
 - **下一里程碑**：掌握更多 crash 类型（如 EXC_BAD_ACCESS 非 zombie 场景、SIGABRT、卡死等）
