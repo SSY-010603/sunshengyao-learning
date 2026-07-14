@@ -1,7 +1,0 @@
-{
-  "string": [
-    { "name": "module_desc", "value": "HelloWorld entry module" },
-    { "name": "ability_desc", "value": "Entry Ability" },
-    { "name": "ability_label", "value": "HelloWorld" }
-  ]
-}
