@@ -1,4 +1,3 @@
-// Index.ets — 首页
 @Entry
 @Component
 struct Index {

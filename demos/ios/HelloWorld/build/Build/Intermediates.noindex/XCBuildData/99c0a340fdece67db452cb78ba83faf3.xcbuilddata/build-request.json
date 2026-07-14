@@ -1,0 +1,65 @@
+{
+  "buildCommand" : {
+    "command" : "build",
+    "skipDependencies" : false,
+    "style" : "buildOnly"
+  },
+  "configuredTargets" : [
+    {
+      "guid" : "2173b576f2c8ae882880c43e8986c0d9a2f1821a459c95ceabc8a09109fcd6d0"
+    }
+  ],
+  "containerPath" : "/Users/sunshengyao/projects/sunshengyao-tutor-learning/demos/ios/HelloWorld/HelloWorld.xcodeproj",
+  "continueBuildingAfterErrors" : false,
+  "dependencyScope" : "workspace",
+  "enableIndexBuildArena" : false,
+  "hideShellScriptEnvironment" : false,
+  "parameters" : {
+    "action" : "build",
+    "activeArchitecture" : "undefined_arch",
+    "activeRunDestination" : {
+      "disableOnlyActiveArch" : true,
+      "hostTargetedPlatform" : null,
+      "platform" : "iphonesimulator",
+      "sdk" : "iphonesimulator26.4",
+      "sdkVariant" : "iphonesimulator",
+      "supportedArchitectures" : [
+        "i386",
+        "x86_64"
+      ],
+      "targetArchitecture" : "undefined_arch"
+    },
+    "arenaInfo" : {
+      "buildIntermediatesPath" : "/Users/sunshengyao/projects/sunshengyao-tutor-learning/demos/ios/HelloWorld/build/Build/Intermediates.noindex",
+      "buildProductsPath" : "/Users/sunshengyao/projects/sunshengyao-tutor-learning/demos/ios/HelloWorld/build/Build/Products",
+      "derivedDataPath" : "/Users/sunshengyao/projects/sunshengyao-tutor-learning/demos/ios/HelloWorld/build",
+      "indexDataStoreFolderPath" : "/Users/sunshengyao/projects/sunshengyao-tutor-learning/demos/ios/HelloWorld/build/Index.noindex/DataStore",
+      "indexEnableDataStore" : true,
+      "indexPCHPath" : "/Users/sunshengyao/projects/sunshengyao-tutor-learning/demos/ios/HelloWorld/build/Index.noindex/PrecompiledHeaders",
+      "pchPath" : "/Users/sunshengyao/projects/sunshengyao-tutor-learning/demos/ios/HelloWorld/build/Build/Intermediates.noindex/PrecompiledHeaders"
+    },
+    "configurationName" : "Debug",
+    "overrides" : {
+      "commandLine" : {
+        "table" : {
+          "SDKROOT" : "iphonesimulator26.4"
+        }
+      },
+      "synthesized" : {
+        "table" : {
+          "ACTION" : "build",
+          "ENABLE_PREVIEWS" : "NO",
+          "ENABLE_XOJIT_PREVIEWS" : "YES",
+          "ONLY_ACTIVE_ARCH" : "YES",
+          "TOOLCHAINS" : "com.apple.dt.toolchain.Metal.32023.883 $(inherited)"
+        }
+      }
+    }
+  },
+  "schemeCommand" : "launch",
+  "showNonLoggedProgress" : true,
+  "useDryRun" : false,
+  "useImplicitDependencies" : true,
+  "useLegacyBuildLocations" : false,
+  "useParallelTargets" : true
+}

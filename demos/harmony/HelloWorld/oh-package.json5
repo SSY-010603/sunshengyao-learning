@@ -1,0 +1,14 @@
+{
+  "name": "helloworld",
+  "version": "1.0.0",
+  "description": "HarmonyOS Hello World Demo",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hvigor-ohos-plugin": "6.1.1",
+    "@ohos/hvigor": "6.1.1"
+  },
+  "overrides": {}
+}

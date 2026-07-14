@@ -14,11 +14,11 @@
     "abilities": [
       {
         "name": "EntryAbility",
-        "srcEntry": "./ets/EntryAbility.ets",
+        "srcEntry": "./ets/entryability/EntryAbility.ets",
         "description": "$string:ability_desc",
-        "icon": "$media:icon",
+        "icon": "$media:layered_image",
         "label": "$string:ability_label",
-        "startWindowIcon": "$media:icon",
+        "startWindowIcon": "$media:layered_image",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
         "skills": [
