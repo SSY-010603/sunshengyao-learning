@@ -1,7 +1,8 @@
 # iOS Crash 疑难排障 #1：Zombie Object（僵尸对象）
 
 > **专题**：Crash 疑难排障 · 第 1 篇
-> **我的背景锚点**：C++ use-after-free、手动内存管理经验、iOS 基础语法水平
+> **我的背景锚点**：C++ use-after-free 经验、日常 ObjC + C/C++ 开发、iOS 基础语法水平
+> **代码风格**：本文所有示例以 **Objective-C 为主**（你日常写的语言），Swift 仅在对比差异时提及
 
 ---
 
@@ -31,31 +32,30 @@ d->age;         // 💥 同上——那块内存已经不是你的了
 
 关键特征：**不稳定复现**。有时候恰好那块内存没被覆盖，`d->bark()` 还能"正常"执行；下次内存被别的东西占用了，就崩了。这是 use-after-free 最恶心的地方——你测的时候不崩，上线后用户崩。
 
-iOS 的 zombie 完全一样，只是触发方式不同：
+iOS 的 zombie 完全一样，只是触发方式是给已释放对象发 ObjC 消息：
 
 ```objc
 // Objective-C（MRC 手动引用计数下）
 // ⚠️ ARC 下不允许手动调 release，这里用 MRC 语法仅为演示 zombie 原理
 NSObject* obj = [[NSObject alloc] init];  // 引用计数 = 1
 [obj release];                           // 引用计数 = 0，对象被 dealloc
-[obj description];                       // 💥 EXC_BAD_ACCESS
+[obj description];                       // 💥 EXC_BAD_ACCESS — 给已释放对象发消息
 ```
 
-```swift
-// Swift 里更隐蔽——通常发生在 Swift 和 ObjC 互调的边界
-let vc = SomeObjCViewController()
-// VC 被 pop 后被释放，但某个闭包/Timer 还持有对它的旧引用
-// 那个引用指向的内存已经不属于这个 VC 了
-vc.title  // 💥 可能触发 zombie
-```
+**C++ 和 ObjC 的关键差异**：
 
-**C++ 和 ObjC 的关键差异**：C++ 里 `delete` 后直接访问成员是未定义行为，编译器可能优化掉、可能崩、可能执行成功。ObjC 里是给已释放对象发消息（`objc_msgSend`），runtime 去查对象的 isa 指针找方法实现，但 isa 已经指向了无效内存——同样未定义行为，但崩溃形态更规律：通常是 `EXC_BAD_ACCESS` 在 `objc_msgSend` 里。
+| | C++ | ObjC |
+|---|---|---|
+| 访问方式 | `d->bark()` 直接调用成员函数 | `[obj description]` 通过 `objc_msgSend` 发消息 |
+| 崩溃机制 | 虚表/成员地址可能无效 → 未定义行为 | isa 指针指向无效内存 → `objc_msgSend` 崩溃 |
+| 典型信号 | 段错误 / 随机崩溃 | `EXC_BAD_ACCESS` 在 `objc_msgSend` |
+| 不稳定复现 | ✅ 同一个 | ✅ 同一个 |
 
 ---
 
 ## ARC 下的对象生死
 
-理解 zombie 前必须搞清楚 iOS 对象是怎么"死"的。ARC 自动管理引用计数：
+理解 zombie 前必须搞清楚 iOS 对象是怎么"死"的。ARC（Automatic Reference Counting）自动管理引用计数——编译器在编译时自动插入 `retain`/`release`/`autorelease` 调用，你不需要手动写。
 
 ```
 创建对象     → 引用计数 = 1
@@ -64,172 +64,189 @@ vc.title  // 💥 可能触发 zombie
 引用计数 = 0 → 系统调用 dealloc，对象被释放
 ```
 
-### 三种引用类型
+### ObjC 三种引用类型
 
 | 类型 | 关键字 | 对引用计数的影响 | 对象释放后的行为 |
 |------|--------|-----------------|-----------------|
 | **强引用** | `strong`（默认） | +1 | 不影响——强引用存在期间对象不会被释放 |
 | **弱引用** | `weak` | 0 | 对象释放后**自动置 nil** → 安全，不会 zombie |
-| **无主引用** | `unowned` | 0 | 对象释放后**不置 nil** → 访问时崩溃（类似 C++ 裸指针） |
+| **不安全引用** | `unsafe_unretained` | 0 | 对象释放后**不置 nil** → 访问时崩溃（类似 C++ 裸指针） |
 
-### Zombie 的根本原因
+> **C++ 类比**：`strong` ≈ `std::shared_ptr`（共享所有权，引用计数归零才释放），`weak` ≈ `std::weak_ptr`（对象销毁后自动过期），`unsafe_unretained` ≈ 裸指针 `T*`（对象销毁后指针不置空，访问即崩）。
 
-**持有对象的强引用被清零（对象被 dealloc），但某个裸引用（unowned / ObjC assign / unsafe 指针）还指向那块旧内存。**
+### ⚠️ ObjC 里还有一个大坑：`assign` vs `weak`
 
-```
-A 持有 B（strong）      → B 的引用计数 = 1
-A 释放对 B 的强引用      → B 的引用计数 = 0 → B 被 dealloc
-C 通过 weak 持有 B      → B 释放后 weak 自动变 nil → C 访问 nil → 安全 ✅
-C 通过 unowned 持有 B   → B 释放后 unowned 还是旧地址 → C 访问 → 崩溃 💥
-C 通过 unsafe 指针持有 B → 同上，指针还是旧地址 → 崩溃 💥
-```
-
-> **C++ 类比**：`weak` ≈ `std::weak_ptr`（对象销毁后自动过期），`unowned` ≈ 裸指针 `T*`（对象销毁后指针不置空），`strong` ≈ `std::shared_ptr`（共享所有权，引用计数归零才释放）。
-
----
-
-## 典型 Zombie 场景（5 类）
-
-### 场景 1：Timer 没清理
-
-最常见的 zombie 陷阱，和之前 basics/02.md 里讲的生命周期清理陷阱一脉相承：
-
-```swift
-class MyViewController: UIViewController {
-    var timer: Timer?
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        
-        // ✅ 闭包 API + weak self：安全
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updateUI()
-        }
-    }
-    
-    override func viewDidDisappear(_ animated: Bool) {
-        super.viewDidDisappear(animated)
-        timer?.invalidate()
-        timer = nil
-    }
-}
-```
-
-**翻车方式 1**：忘了在 `viewDidDisappear` 里 invalidate。
-
-VC 被 pop → dealloc → 但 timer 还在 RunLoop 里跑 → timer 的闭包里 `self?.updateUI()` 因为用了 weak 所以是 nil 不会崩……但如果用的是 target-action 方式就炸了：
-
-```swift
-// ❌ target-action 方式：Timer 强引用 target
-// iOS 10 之前的 API，很多老代码还是这种写法
-timer = Timer.scheduledTimer(timeInterval: 1.0,
-    target: self,
-    selector: #selector(updateUI),
-    userInfo: nil, repeats: true)
-```
-
-这种写法下：
-1. self（强引用）→ timer，timer（强引用）→ self → **循环引用**
-2. 循环引用的结果是**两者都泄漏**，deinit 永远不被调用
-3. 如果你在外部某个时机手动 `timer?.invalidate()` → 打破循环 → self 被 dealloc
-4. 但 RunLoop 中可能还持有对这次 timer 调度的安排（invalidate 和 RunLoop 移除不是原子操作）
-5. timer 下次 fire 时尝试给已释放的 self 发 `updateUI` 消息 → **zombie**
-
-**翻车方式 2**：在 `deinit` 里才 invalidate。
-
-```swift
-// ❌ 错误：deinit 里才清理 timer
-deinit {
-    timer?.invalidate()  // 如果有循环引用，deinit 永远不会被调用！
-}
-```
-
-循环引用导致 deinit 不调 → timer 不 invalidate → 循环引用继续 → **死锁般的泄漏**。这是"泄漏"不是"zombie"，但如果有人手动打破循环，就变 zombie。
-
-### 场景 2：闭包强引用 self
-
-```swift
-class ProfileViewController: UIViewController {
-    let avatarView = UIImageView()
-    
-    func loadImage() {
-        // ✅ weak self 防止循环引用
-        ImageLoader.shared.load(url: avatarURL) { [weak self] image in
-            self?.avatarView.image = image  // self 已释放则为 nil，安全
-        }
-        
-        // ❌ 危险写法：闭包强捕获 self
-        ImageLoader.shared.load(url: avatarURL) { image in
-            self.avatarView.image = image  // 强引用 self
-        }
-        // 如果 VC 在回调返回前就被释放了，闭包还持有 self
-        // self 不会被 dealloc（闭包强引用了它）→ 这是泄漏，不是 zombie
-        // 但如果 ImageLoader 内部在回调后释放了闭包 → self 引用计数归零 → dealloc
-        // 之后如果还有其他裸引用指向 self → zombie
-    }
-}
-```
-
-> **注意区分**：闭包强引用 self 导致的是**泄漏**（self 无法释放），不是直接 zombie。泄漏是 zombie 的前因之一——泄漏的对象在某个时机被打破循环后释放，其他裸引用就变 zombie。
-
-### 场景 3：Delegate 没用 weak
-
-```swift
-// ❌ 错误：delegate 用了 strong（Swift 里默认就是 strong）
-class TableViewController: UIViewController {
-    var delegate: SomeDelegate?  // 默认 strong！
-}
-
-// ✅ 正确：delegate 必须 weak
-class TableViewController: UIViewController {
-    weak var delegate: SomeDelegate?
-}
-```
-
-经典循环引用：A.delegate = B，B.owningView = A。delegate 是 strong → A 和 B 互相持有 → 泄漏。一旦外部打破循环（比如手动将 delegate 置 nil），其中一方被释放后另一方还持有旧指针 → zombie。
-
-### 场景 4：ObjC 和 Swift 混编 — assign property
-
-这是重灾区，尤其对有老 ObjC 代码库的项目：
+在 ObjC 的 `@property` 声明里，对象类型有两种"不持有"的修饰：
 
 ```objc
-// ObjC 头文件
-// ✅ ARC 时代的正确写法
-@property (nonatomic, weak) id<SomeDelegate> delegate;
+// ARC 时代的正确写法
+@property (nonatomic, weak) id<SomeDelegate> delegate;        // ✅ 释放后自动置 nil
 
-// ❌ MRC 时代的遗留写法
-@property (nonatomic, assign) id<SomeDelegate> delegate;
+// MRC 时代的遗留写法——ARC 下编译通过但不安全
+@property (nonatomic, assign) id<SomeDelegate> delegate;      // ❌ 释放后不置 nil → zombie
 ```
-
-**`assign` 和 `weak` 的关键区别**：
 
 | | `weak` | `assign` |
 |---|---|---|
 | 引用计数 | 0（不持有） | 0（不持有） |
 | 对象释放后 | **自动置 nil** | **不置 nil，还是旧地址** |
 | 之后访问 | 安全（nil 不崩） | 💥 zombie |
-| ARC 支持 | ✅ | ⚠️ 编译通过但不安全 |
+| ARC 支持 | ✅ 完全支持 | ⚠️ 编译通过但不安全 |
 
-**混编时的坑**：Swift 侧以为 ARC 会自动处理一切，但 ObjC 侧的 `assign` 指针完全不受 ARC 保护。当 delegate 指向的对象被释放后，assign 指针还是旧地址，再通过它发消息 → zombie。
+**`assign` 对对象类型永远是安全隐患**。`assign` 本来是给非对象类型用的（`NSInteger`、`CGFloat`、`C 结构体`等），在 MRC 时代被广泛用于 delegate，ARC 引入后应该全部改为 `weak`，但老代码里大量遗留。
 
-> 在 ARC 引入前（2011 年前），`assign` 是 ObjC delegate 的标准写法。如果你的项目有历史代码，混编头文件巡检是必须做的。
+> 在 ARC 引入前（2011 年前），`assign` 是 ObjC delegate 的标准写法。如果你的项目有历史代码，混编头文件巡检是必须做的——后文"场景 4"详述。
 
-### 场景 5：KVO 未正确移除
+### Zombie 的根本原因
 
-```swift
-// 添加观察
-someObj.addObserver(self, forKeyPath: "value", options: .new, context: nil)
+**持有对象的强引用被清零（对象被 dealloc），但某个裸引用（unsafe_unretained / assign / 裸指针）还指向那块旧内存。**
 
-// ❌ 如果忘了在 deinit 前移除
-// self 被 dealloc 后，someObj 发 KVO 通知还会尝试调用 self.observeValue(forKeyPath:...) → zombie
+```
+A 持有 B（strong）        → B 的引用计数 = 1
+A 释放对 B 的强引用        → B 的引用计数 = 0 → B 被 dealloc
+C 通过 weak 持有 B        → B 释放后 weak 自动变 nil → C 访问 nil → 安全 ✅
+C 通过 unsafe_unretained   → B 释放后还是旧地址 → C 访问 → 崩溃 💥
+C 通过 assign 持有 B       → 同上 → 崩溃 💥
+C 通过 __unsafe_unretained → 同上 → 崩溃 💥
+```
 
-// ✅ 正确做法：在观察者被释放前移除
-deinit {
-    someObj.removeObserver(self, forKeyPath: "value")
+---
+
+## 典型 Zombie 场景（5 类）
+
+### 场景 1：Timer / NSTimer 没清理
+
+最常见的 zombie 陷阱：
+
+```objc
+// ❌ 危险写法：NSTimer target-action 方式
+@interface MyViewController : UIViewController
+@property (nonatomic, strong) NSTimer *timer;
+@end
+
+@implementation MyViewController
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    // NSTimer 强引用 target(self)
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                  target:self
+                                                selector:@selector(updateUI)
+                                                userInfo:nil
+                                                 repeats:YES];
+    // self(强引用) → timer，timer(强引用) → self → 循环引用
+    // 结果：两者都泄漏，dealloc 永远不被调用
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    // 如果忘了在这里 invalidate，VC 被 pop 后 timer 还在跑
+    // 如果用了 target-action，timer 还强引用 self，不会 dealloc → 泄漏
+    self.timer = nil;  // ❌ nil 了属性但没 invalidate，timer 还在 RunLoop 里
+}
+
+@end
+```
+
+**正确的清理方式**：
+
+```objc
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    [self.timer invalidate];  // ✅ 先 invalidate（从 RunLoop 移除 + 打破对 target 的强引用）
+    self.timer = nil;         // ✅ 再置 nil
 }
 ```
 
-> **⚠️ 注意**：iOS 11+ 如果用的是新 API `observe(_:options:changeHandler:)` 返回的 `NSKeyValueObservation` 对象，只要持有它的属性被置 nil，观察会自动移除。但老 API `addObserver(_:forKeyPath:...)` 必须手动移除。
+**翻车链路**：
+
+```
+1. target-action → self 和 timer 循环引用 → 泄漏（不是 zombie）
+2. 某个时机手动 invalidate → 打破循环 → self 被 dealloc
+3. 但 RunLoop 中可能还持有对 timer 的调度安排（invalidate 和 RunLoop 移除不是原子操作）
+4. timer 下次 fire 时给已释放的 self 发消息 → zombie
+```
+
+> **iOS 10+ 的闭包 API**：`[NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^{ ... }]`，闭包不强引用 target，配合 `__weak typeof(self) weakSelf = self;` 使用更安全。但很多老代码库还在用 target-action。
+
+### 场景 2：Block 闭包强引用 self
+
+```objc
+// ❌ 危险写法：block 直接捕获 self
+- (void)loadImage {
+    [ImageLoader shared].loadCompletion = ^(UIImage *image) {
+        self.avatarView.image = image;  // block 强引用 self
+    };
+    // self(强引用) → ImageLoader(强引用) → block(强引用) → self → 循环引用
+    // self 无法释放 → 泄漏
+}
+
+// ✅ 正确写法：weak-strong dance
+- (void)loadImage {
+    __weak typeof(self) weakSelf = self;
+    [ImageLoader shared].loadCompletion = ^(UIImage *image) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;  // self 已释放，安全退出
+        strongSelf.avatarView.image = image;
+    };
+}
+```
+
+> **为什么要 weak-strong dance 而不是只写 weak？** `weakSelf` 保证 block 不强引用 self（打破循环引用）。`strongSelf` 保证在 block 执行期间 self 不会被释放（防止执行到一半 self 被 dealloc 变 zombie）。只用 weak 不用 strong，block 执行期间 self 可能被其他线程释放。
+
+### 场景 3：Delegate 没用 weak
+
+```objc
+// ❌ 错误：delegate 用了 strong（默认）或 assign
+@interface MyManager : NSObject
+@property (nonatomic, strong) id<MyDelegate> delegate;    // ❌ strong delegate
+@end
+
+// ✅ 正确：delegate 必须 weak
+@interface MyManager : NSObject
+@property (nonatomic, weak) id<MyDelegate> delegate;      // ✅ weak delegate
+@end
+```
+
+经典循环引用模式：VC.delegate = manager，manager.delegate = VC。如果 delegate 是 strong，VC 和 manager 互相持有 → 泄漏。一旦外部打破循环（比如手动 delegate = nil），其中一方被释放后另一方还持有旧指针 → zombie。
+
+如果用的是 `assign`：不构成循环引用（assign 不增加引用计数），但 delegate 指向的对象被释放后 assign 不置 nil → 直接 zombie。
+
+### 场景 4：`assign` property（ObjC 混编重灾区）
+
+这是 ObjC 项目里最隐蔽的 zombie 来源：
+
+```objc
+// ObjC 头文件 — 10 年前的标准写法
+@interface SomeOldClass : NSObject
+@property (nonatomic, assign) id<SomeDelegate> delegate;  // ❌ 2011 年前的遗留
+@end
+
+// 当 delegate 指向的 VC 被释放后：
+// - weak property：自动 delegate = nil ✅
+// - assign property：delegate 还是旧地址 → 给已释放对象发消息 → zombie 💥
+```
+
+**为什么 assign 在 ARC 下编译通过？** ARC 只管理 `strong`/`weak` 的引用计数自动加减。`assign` 对对象类型在 ARC 下的语义是"不持有，不管生死"——编译器不报错，但 runtime 不保护。Apple 没有把它标记为 deprecated（为了兼容 MRC 代码），但它对对象类型**永远是安全隐患**。
+
+> **实操建议**：用脚本扫描所有 `.h` 文件中 `@property (nonatomic, assign) id` 模式的声明，逐个改为 `weak`。非对象类型（NSInteger、CGFloat、struct）保留 assign 不受影响。
+
+### 场景 5：KVO 未正确移除
+
+```objc
+// 添加观察
+[someObj addObserver:self forKeyPath:@"value" options:NSKeyValueObservingOptionNew context:NULL];
+
+// ❌ 如果忘了在 dealloc 前移除
+// self 被 dealloc 后，someObj 发 KVO 通知还会尝试调用 self 的 observeValueForKeyPath: → zombie
+
+// ✅ 正确做法
+- (void)dealloc {
+    [someObj removeObserver:self forKeyPath:@"value"];
+}
+```
+
+> **⚠️ 注意**：如果存在循环引用导致 `dealloc` 不被调用，那 KVO 也不会移除——泄漏，不是 zombie。但循环引用被打破后，KVO 移除和 dealloc 的顺序可能出问题，导致 zombie。
 
 ---
 
@@ -237,7 +254,8 @@ deinit {
 
 | 症状 | 说明 |
 |------|------|
-| **EXC_BAD_ACCESS (code=1 或 code=2)** | 访问已释放的内存。code=1 是读取，code=2 是写入 |
+| **EXC_BAD_ACCESS (code=1)** | 读取了已释放的内存 |
+| **EXC_BAD_ACCESS (code=2)** | 写入了已释放的内存 |
 | **崩溃在 `objc_msgSend`** | 调用栈里看到 `objc_msgSend` — 在给已释放对象发消息 |
 | **不稳定复现** | 同一个操作有时崩有时不崩 — 典型的 zombie 特征 |
 | **崩溃地址看起来像有效对象** | 地址曾是合法的对象地址，只是内存已被回收 |
@@ -259,7 +277,7 @@ Thread 0 Crashed:
 
 ### 工具 1：NSZombieEnabled（首选，最快定位）
 
-**原理**：开启后，runtime 在对象 dealloc 时**不真正回收内存**，而是把对象的 isa 指针替换为一个特殊的 zombie class。当你再给这个 zombie 对象发消息时，zombie class 的 `forwardInvocation` 会打印明确日志，告诉你"你给一个已释放的 XXX 类对象发了 YYY 消息"。
+**原理**：开启后，runtime 在对象 dealloc 时**不真正回收内存**，而是把对象的 isa 指针替换为一个特殊的 zombie class（如 `_NSZombie_MyViewController`）。当你再给这个 zombie 对象发消息时，zombie class 的 `forwardInvocation:` 会打印明确日志。
 
 **Xcode 中开启**：
 
@@ -273,19 +291,19 @@ Thread 0 Crashed:
 *** -[MyViewController respondsToSelector:]: message sent to deallocated instance 0x7fe8a3c0
 ```
 
-这直接告诉你：`MyViewController` 已被释放，但你还在给它发 `respondsToSelector:` 消息。
+直接告诉你：`MyViewController` 已被释放，但你还在给它发 `respondsToSelector:` 消息。
 
-**在代码中开启**（适合无法用 Xcode Scheme 的场景，如 CI）：
+**在代码中开启**（适合 CI 或无法用 Xcode Scheme 的场景）：
 
-```swift
-// AppDelegate.swift — 仅 Debug 模式
-func application(_ application: UIApplication,
-                 didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-    #if DEBUG
-    setenv("NSZombieEnabled", "YES", 1)
-    setenv("NSDeallocateZombies", "YES", 1)
-    #endif
-    return true
+```objc
+// AppDelegate.m — 仅 Debug 模式
+- (BOOL)application:(UIApplication *)application
+    didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+#ifdef DEBUG
+    setenv("NSZombieEnabled", "YES", 1);
+    setenv("NSDeallocateZombies", "YES", 1);
+#endif
+    return YES;
 }
 ```
 
@@ -304,8 +322,8 @@ func application(_ application: UIApplication,
 
 Instruments 会显示：
 - 哪个类被 zombie 访问了
-- 什么时候 alloc 的
-- 什么时候 dealloc 的
+- 什么时候 `alloc` 的
+- 什么时候 `dealloc` 的
 - **谁在 dealloc 之后还给它发了消息**（点击 zombie 事件可看调用栈）
 
 **优势**：不只告诉你"对象已释放"，还能告诉你**对象是怎么死的**以及**谁在它死后还访问了它**。
@@ -322,7 +340,7 @@ Xcode 7+ 引入，能检测多种内存错误（不只是 zombie）：
 =================================================================
 ==12345==ERROR: AddressSanitizer: heap-use-after-free on 0x603000012345
 READ of size 8 at 0x603000012345
-    #0 0x10a2b3c in objc_msgSend 
+    #0 0x10a2b3c in objc_msgSend
     #1 0x10a1f4d in -[MyVC viewDidAppear:]
 previously freed by thread T0 here:
     #0 0x10b2a3c in free
@@ -331,7 +349,7 @@ previously freed by thread T0 here:
 
 **ASan 的优势**：同时给出"释放调用栈"和"非法访问调用栈"，直接看到是哪里释放的、哪里又访问了。
 
-> **⚠️ 注意**：ASan 和 Zombie Objects 不能同时开启，二选一。ASan 性能开销更大（约 2x 慢），但信息更全。Zombie 模式更轻量，适合快速确认。
+> **⚠️ 注意**：ASan 和 Zombie Objects **不能同时开启**，二选一。ASan 性能开销更大（约 2x 慢），但信息更全。Zombie 模式更轻量，适合快速确认。
 
 ### 工具 4：Malloc Scribble（辅助确认）
 
@@ -388,24 +406,24 @@ Malloc Scribble 会在对象释放后把那块内存填充为特定模式（`0xA
 
 | 检查项 | 怎么查 |
 |--------|--------|
-| delegate 是 strong 还是 weak？ | 搜索 `var delegate` 看有没有 `weak` |
-| 闭包是否用了 `[weak self]`？ | 搜索闭包内的 `self.` 调用 |
-| Timer 是否在 `viewDidDisappear` 中 invalidate？ | 检查 timer 的生命周期管理 |
-| KVO 是否在 deinit 前 remove？ | 搜索 `addObserver` 确认有对应 remove |
-| NotificationCenter 是否在 deinit 前 remove？ | 搜索 `addObserver` 确认有对应 remove |
-| ObjC 的 property 是否用了 assign 而非 weak？ | 检查混编头文件 |
-| unowned 是否用在了可能先释放的场景？ | 检查 `unowned` 使用位置 |
+| delegate 是 strong 还是 weak？ | 搜索 `@property *delegate` 看修饰词 |
+| block 是否用了 `__weak self`？ | 搜索 block 内的 `self->` 或 `self.` 调用 |
+| NSTimer 是否在 `viewDidDisappear` 中 invalidate？ | 检查 timer 的生命周期管理 |
+| KVO 是否在 dealloc 前 remove？ | 搜索 `addObserver` 确认有对应 `removeObserver` |
+| NSNotificationCenter 是否在 dealloc 前 remove？ | 同上 |
+| ObjC 的 `@property` 是否用了 assign 而非 weak？ | 搜索 `@property (nonatomic, assign) id` |
+| `__unsafe_unretained` 是否用在了可能先释放的场景？ | 搜索 `__unsafe_unretained` 使用位置 |
 
 ### 第五步：修复
 
 | 原因 | 修复 |
 |------|------|
-| delegate 是 strong | 改为 `weak var delegate` |
-| 闭包强引用 self | 改为 `[weak self] in` |
-| Timer 没清理 | `viewDidDisappear` 中 invalidate + nil |
-| KVO 没移除 | deinit 前 `removeObserver` |
+| delegate 是 strong | 改为 `@property (nonatomic, weak)` |
+| block 强引用 self | 用 `__weak typeof(self) weakSelf = self;` + weak-strong dance |
+| Timer 没清理 | `viewDidDisappear` 中 `[timer invalidate]` + `self.timer = nil` |
+| KVO 没移除 | dealloc 前 `removeObserver` |
 | ObjC assign property | 改为 `weak` |
-| unowned 误用 | 改为 `weak` 或确保生命周期对齐 |
+| `__unsafe_unretained` 误用 | 改为 `__weak` 或确保生命周期对齐 |
 
 ---
 
@@ -415,10 +433,14 @@ Malloc Scribble 会在对象释放后把那块内存填充为特定模式（`0xA
 
 ### 方案 1：Hook dealloc（自建基建）
 
-**核心思路**：swizzle dealloc，在对象释放后不立即回收内存，而是把 isa 替换为 zombie class，短暂保留（3-10 秒），期间如果有人给这个 zombie 对象发消息，就记录类名和调用栈上报。
+**核心思路**：swizzle `dealloc`，在对象释放后不立即回收内存，而是把 isa 替换为 zombie class，短暂保留（3-10 秒），期间如果有人给这个 zombie 对象发消息，就在 zombie class 的 `forwardInvocation:` 中记录类名和调用栈上报。
 
 ```objc
 // 伪代码示意 — 生产环境 Zombie 检测的核心思路
+// 1. swizzle dealloc：释放后将对象 isa 指向一个特殊的 zombie class
+// 2. 当消息发给 zombie class 时，在 forwardInvocation: 中记录类名和调用栈上报
+// 3. 延迟一段时间后真正释放内存
+
 static void swizzled_dealloc(id self, SEL _cmd) {
     const char *className = class_getName(object_getClass(self));
     // 将 isa 替换为 _NSZombie_OriginalClass，对象"变成"zombie
@@ -427,7 +449,7 @@ static void swizzled_dealloc(id self, SEL _cmd) {
     if (zombieClass) {
         object_setClass(self, zombieClass);
     }
-    // 将对象地址 + 类名记入一个纯 C 数组的延迟释放队列
+    // 将对象地址 + 类名记入一个纯 C 结构体的延迟释放队列
     // （绝不能在 block 里捕获 self，block 会强引用 zombie 对象导致永远不释放）
     // 延迟队列会在 N 秒后批量调用原始 dealloc 真正释放
 }
@@ -437,9 +459,9 @@ static void swizzled_dealloc(id self, SEL _cmd) {
 
 - **不能永不释放**（会 OOM），只能短暂保留 3-10 秒后真正 dealloc
 - **必须采样**：不是所有类都 hook，只 hook 可疑的类（如自定义 VC / View），否则内存压力太大
-- **性能策略**：直接 hook `objc_msgSend` 开销极大（它是全 App 调用频率最高的函数）；更实际的做法是 hook `dealloc` + 在 zombie class 的 `forwardInvocation` 中上报
+- **性能策略**：直接 hook `objc_msgSend` 开销极大（它是全 App 调用频率最高的函数）；更实际的做法是 hook `dealloc` + 在 zombie class 的 `forwardInvocation:` 中上报
 - **配合 crash 上报**：zombie 检测结果需要随 crash 报告一起上报（如 PLCrashReporter、KSCrash）
-- **延迟队列实现**：用纯 C 数组记录地址+类名+入队时间，不能 block 捕获 self
+- **延迟队列实现**：用纯 C 数组 / 结构体记录地址+类名+入队时间，**不能 block 捕获 self**
 
 ### 方案 2：基于 Crash 报告的归因
 
@@ -458,41 +480,41 @@ static void swizzled_dealloc(id self, SEL _cmd) {
 
 不直接检测 zombie，而是检测**循环引用**——zombie 的前因之一：
 
-```swift
+```objc
 // 用法示意（简化）
-let detector = FBRetainCycleDetector(object: viewController)
-let retainCycles = detector.findRetainCycles()
+FBRetainCycleDetector *detector = [[FBRetainCycleDetector alloc] initWithObject:viewController];
+NSSet *retainCycles = [detector findRetainCycles];
 // retainCycles 会返回发现的循环引用路径，如：
-// VC → closure → VC  或  VC → timer → VC
+// VC → block → VC  或  VC → timer → VC
 ```
 
-这个工具解决的是"泄漏"问题，间接防止"泄漏打破后变 zombie"。但它不能检测 unowned / assign 导致的 zombie。
+这个工具解决的是"泄漏"问题，间接防止"泄漏打破后变 zombie"。但它不能检测 `unsafe_unretained` / `assign` 导致的 zombie。
 
 ---
 
 ## 防范 Zombie 的编码规范
 
-| 规范 | 说明 | 正确示例 |
-|------|------|---------|
-| **delegate 一律 weak** | 无例外，没有"这个 delegate 不会提前释放"的假设 | `weak var delegate: SomeDelegate?` |
-| **闭包默认 [weak self]** | 除非你能 100% 确认闭包生命周期 ≤ self | `{ [weak self] in self?.doStuff() }` |
-| **Timer 用闭包 API** | iOS 10+ 用 block-based API，避免 target-action | `Timer.scheduledTimer(withTimeInterval:repeats:block:)` |
-| **viewDidDisappear 清理** | timer、通知监听、KVO 都在这里 invalidate/remove | 不要指望 deinit 会调（循环引用会阻止） |
-| **unowned 慎用** | 只在两个对象生命周期严格一致时用（如 self 和它的 view），否则用 weak | 不确定就用 weak，多一次可选解包比崩好 |
-| **混编头文件巡检** | 扫描 ObjC `.h` 里的 `assign` property，逐个改为 `weak` | `assign` 对对象类型永远是安全隐患 |
-| **dealloc 日志** | Debug 下每个关键类的 deinit 都打日志 | 确认对象是否被按时释放，泄漏早发现 |
+| 规范 | 说明 | ObjC 正确示例 |
+|------|------|---------------|
+| **delegate 一律 weak** | 无例外 | `@property (nonatomic, weak) id<SomeDelegate> delegate;` |
+| **block 默认 weak self** | 除非能 100% 确认 block 生命周期 ≤ self | `__weak typeof(self) weakSelf = self;` + weak-strong dance |
+| **NSTimer 用 block API** | iOS 10+ 用 block-based API，避免 target-action | `[NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^{ ... }]` |
+| **viewDidDisappear 清理** | timer、通知监听、KVO 都在这里 invalidate/remove | 不要指望 dealloc 会调（循环引用会阻止） |
+| **`__unsafe_unretained` 慎用** | 只在两个对象生命周期严格一致时用，否则用 weak | 不确定就用 weak，多一次 nil 判断比崩好 |
+| **混编头文件巡检** | 扫描 `.h` 里 `@property (nonatomic, assign) id` 模式，逐个改 weak | assign 对对象类型永远是安全隐患 |
+| **dealloc 日志** | Debug 下每个关键类的 dealloc 都打日志 | 确认对象是否被按时释放，泄漏早发现 |
 
 ---
 
 ## 关键要点总结
 
-1. **Zombie = use-after-free**，C++ 里叫 `delete` 后访问，iOS 里叫给已释放对象发消息，本质一样
-2. **ARC 不是万能的**：ARC 只管引用计数的自动加减，不管 weak/unowned/闭包/Timer 的误用
+1. **Zombie = use-after-free**，C++ 里叫 `delete` 后访问，ObjC 里叫给已释放对象发消息，本质一样
+2. **ARC 不是万能的**：ARC 只管引用计数的自动加减，不管 weak/unsafe_unretained/block/Timer 的误用
 3. **泄漏和 zombie 是因果关系**：循环引用导致泄漏，泄漏被打破后裸引用变 zombie
-4. **5 类典型场景**：Timer 没清理、闭包强引用 self、delegate 非 weak、ObjC assign property、KVO 未移除
+4. **5 类典型场景**：Timer 没清理、block 强引用 self、delegate 非 weak、ObjC assign property、KVO 未移除
 5. **排障首选 NSZombieEnabled**，一行日志直接定位类名；需要调用栈用 ASan；需要生命周期全貌用 Instruments
 6. **生产监控靠基建**：hook dealloc + 延迟释放 + 采样上报，或基于 crash 报告的调用栈归因
-7. **防范重于排障**：delegate 一律 weak、闭包默认 [weak self]、Timer 用闭包 API、混编头文件巡检
+7. **防范重于排障**：delegate 一律 weak、block 默认 weak self、Timer 用 block API、混编头文件巡检
 
 ---
 
