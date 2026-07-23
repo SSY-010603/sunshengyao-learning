@@ -20,8 +20,8 @@
 - 网络通信：✅(iOS)
 - 数据持久化：✅(iOS)
 - 多线程与异步编程：✅(iOS)
-- 权限管理：⚪
-- 资源管理与国际化：⚪
+- 权限管理：✅(iOS)
+- 资源管理与国际化：✅(iOS)
 
 ### 前端方向
 > 未开启前端方向，暂不维护。
@@ -31,7 +31,7 @@
 ### 客户端 - iOS
 - 阶段 1（入门）：✅ 已完成
 - 阶段 2（进阶）：✅ 已完成
-- 阶段 3（完备）：⚪ 未开始
+- 阶段 3（完备）：✅ 已完成
 
 ## 学习进度
 
@@ -76,8 +76,37 @@
 - 线程陷阱：竞态条件、Block 捕获变量时机、异步回调 self 生命周期（basics/08.md）
 
 ### 客户端 - iOS Crash 排障
-最近学习时间：2026-07-14
+最近学习时间：2026-07-20
 已掌握知识点：
 - Zombie Object = 访问已释放的对象（use-after-free），典型场景：Timer没清理/闭包强引用/delegate非weak/KVO没移除（crash/01-zombie.md）
 - 排障工具：NSZombieEnabled快速定位类名、Instruments看完整生命周期、ASan给释放/访问双调用栈（crash/01-zombie.md）
 - 生产监控思路：hook dealloc + 延迟释放 + 采样上报，或基于crash报告调用栈归因（crash/01-zombie.md）
+- SIGABRT = 进程主动 abort，绝大多数来自 NSException 未捕获；NSException vs NSError：前者不可恢复（throw），后者可恢复（返回值）（crash/02-sigabrt.md）
+- 四类常见 NSException：NSRangeException（越界）、NSInvalidArgumentException（插nil/unrecognized selector）、NSInternalInconsistencyException（断言）、KVO 重复移除（crash/02-sigabrt.md）
+- NSAssert 在 Release 下是 no-op，生产兜底要手动 if + raise（crash/02-sigabrt.md）
+- ObjC 异常和 C++ 异常是两套机制，跨语言不互通，混编时 C++ 侧自己 try-catch 翻译成 NSException（crash/02-sigabrt.md）
+- Watchdog 机制：主线程卡 8 秒会被杀进程（信号 0x8badf00d），典型场景是 dispatch_sync 死锁（crash/02-sigabrt.md）
+- try-catch 谨慎用：解析不可信数据兜底、KVO 移除兜底是合理场景，不能当控制流（crash/02-sigabrt.md）
+- 排障三板斧：Exception Breakpoint（开发）、symbolicatecrash/atos（线上符号化）、hook objc_exception_throw（监控）（crash/02-sigabrt.md）
+
+### 客户端 - iOS 阶段 3
+最近学习时间：2026-07-23
+已掌握知识点：
+- 权限四步流程：Info.plist 声明 → 检查状态 → 请求授权 → 处理结果（basics/09.md）
+- Info.plist 权限键和用途描述审核要求，文案必须写清具体用途（basics/09.md）
+- 四态状态机：NotDetermined / Authorized / Denied / Restricted（basics/09.md）
+- 相机权限：AVCaptureDevice API，回调在任意线程需回主线程（basics/09.md）
+- 相册权限：iOS 14+ Limited 模式，读写权限分离（basics/09.md）
+- 定位权限：WhenInUse / Always 两级授权，后台定位审核严（basics/09.md）
+- ATT 跟踪权限：iOS 14.5+，IDFA 获取前提（basics/09.md）
+- 权限撤销处理：进入前台时重新检查，提供降级方案（basics/09.md）
+- 授权时机：用户主动触发 + 预解释模式，授权率最高（basics/09.md）
+- Asset Catalog 管理图片：自动切片、自动适配深色模式、App Thinning 按需加载（basics/10.md）
+- imageNamed 缓存机制 + 大图用 imageWithContentsOfFile（basics/10.md）
+- NSLocalizedString + .strings 实现多语言（basics/10.md）
+- 复数处理用 .stringsdict 配合 NSStringPluralRuleType（basics/10.md）
+- 字符串拼接陷阱：不同语言语序不同，必须用完整带占位符的翻译（basics/10.md）
+- 日期/数字格式化用 NSDateFormatter / NSNumberFormatter（basics/10.md）
+- 深色模式：dynamicColorNamed + Asset Catalog 颜色 + traitCollectionDidChange（basics/10.md）
+- Dynamic Type：preferredFontForTextStyle + adjustsFontForContentSizeCategory（basics/10.md）
+- 实战模式：封装 R 类统一管理资源（basics/10.md）
